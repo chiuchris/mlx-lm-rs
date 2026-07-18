@@ -285,14 +285,14 @@ impl Model {
             }
         }
 
-        let mut missing: Vec<&str> = params
+        let mut missing: Vec<String> = params
             .keys()
-            .filter(|k| !loaded_keys.contains(&**k))
-            .map(|k| &**k)
+            .map(|k| k.to_string())
+            .filter(|k| !loaded_keys.contains(k))
             .collect();
         if !missing.is_empty() {
             missing.sort();
-            let head = missing.iter().take(5).copied().collect::<Vec<_>>().join(", ");
+            let head = missing.iter().take(5).map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
             let tail = if missing.len() > 5 {
                 format!(" (+{} more)", missing.len() - 5)
             } else {

@@ -1,36 +1,73 @@
 //! Greedy parity check vs python `mlx_lm.generate` on the same Qwen3 model.
 //!
-//! This test is `#[ignore]` by default — it requires:
-//!   * `pip install mlx-lm` available on PATH (`python3 -m mlx_lm.generate`)
-//!   * `mlx-community/Qwen3-0.6B-bf16` already downloaded into the local
-//!     HF cache (running our binary once with the same model triggers download)
+//! This test is `#[ignore]` by default. Its default case requires:
+//!   * `pip install mlx-lm` available on PATH (`python3 -m mlx_lm generate`)
+//!   * `mlx-community/Qwen3-0.6B-bf16` already downloaded into the local HF cache
 //!
-//! Run with:
-//!   `cargo test --release --test parity_qwen3 -- --ignored --nocapture`
+//! Override `MLX_LM_RS_PARITY_MODEL`, `MLX_LM_RS_PARITY_PROMPT`,
+//! `MLX_LM_RS_PARITY_MAX_TOKENS`, and `MLX_LM_RS_PARITY_PYTHON` to probe another
+//! cached checkpoint without weakening the exact output comparison.
 
 use std::process::Command;
 
-const MODEL: &str = "mlx-community/Qwen3-0.6B-bf16";
-const PROMPT: &str = "The capital of France is";
-const MAX_TOKENS: usize = 16;
+const DEFAULT_MODEL: &str = "mlx-community/Qwen3-0.6B-bf16";
+const DEFAULT_PROMPT: &str = "The capital of France is";
+const DEFAULT_MAX_TOKENS: usize = 16;
+const DEFAULT_PYTHON: &str = "python3";
 
-fn run_python_greedy() -> String {
-    let out = Command::new("python3")
+struct ParityCase {
+    model: String,
+    prompt: String,
+    max_tokens: usize,
+    python: String,
+}
+
+impl ParityCase {
+    fn from_env() -> Self {
+        let max_tokens = std::env::var("MLX_LM_RS_PARITY_MAX_TOKENS")
+            .map(|value| {
+                value
+                    .parse()
+                    .expect("MLX_LM_RS_PARITY_MAX_TOKENS must be a positive integer")
+            })
+            .unwrap_or(DEFAULT_MAX_TOKENS);
+        assert!(max_tokens > 0, "parity max_tokens must be positive");
+
+        Self {
+            model: std::env::var("MLX_LM_RS_PARITY_MODEL")
+                .unwrap_or_else(|_| DEFAULT_MODEL.to_string()),
+            prompt: std::env::var("MLX_LM_RS_PARITY_PROMPT")
+                .unwrap_or_else(|_| DEFAULT_PROMPT.to_string()),
+            max_tokens,
+            python: std::env::var("MLX_LM_RS_PARITY_PYTHON")
+                .unwrap_or_else(|_| DEFAULT_PYTHON.to_string()),
+        }
+    }
+}
+
+fn run_python_greedy(case: &ParityCase) -> String {
+    let max_tokens = case.max_tokens.to_string();
+    let out = Command::new(&case.python)
         .args([
             "-m",
             "mlx_lm",
             "generate",
             "--model",
-            MODEL,
+            &case.model,
             "--prompt",
-            PROMPT,
+            &case.prompt,
             "--max-tokens",
-            &MAX_TOKENS.to_string(),
+            &max_tokens,
             "--temp",
             "0",
         ])
         .output()
-        .expect("python3 -m mlx_lm.generate failed to launch (is `pip install mlx-lm` done?)");
+        .unwrap_or_else(|error| {
+            panic!(
+                "{} -m mlx_lm generate failed to launch: {error}",
+                case.python
+            )
+        });
     assert!(
         out.status.success(),
         "python mlx_lm exited non-zero: {}",
@@ -39,35 +76,39 @@ fn run_python_greedy() -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-fn run_rust_greedy() -> String {
+fn run_rust_greedy(case: &ParityCase) -> String {
     let bin = env!("CARGO_BIN_EXE_mlx-lm-rs");
+    let max_tokens = case.max_tokens.to_string();
     let out = Command::new(bin)
         .args([
             "generate",
             "--model",
-            MODEL,
+            &case.model,
             "--prompt",
-            PROMPT,
+            &case.prompt,
             "--max-tokens",
-            &MAX_TOKENS.to_string(),
+            &max_tokens,
             "--temp",
             "0",
         ])
         .output()
         .expect("our binary failed to launch");
-    assert!(out.status.success(), "rust mlx-lm-rs exited non-zero");
+    assert!(
+        out.status.success(),
+        "rust mlx-lm-rs exited non-zero: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 /// Extract just the generated text. Python wraps it in `==========` lines and
-/// then prints stats; ours streams to stdout, prefixed with `[mlx-lm-rs]` log
-/// lines on stderr (so stdout is purely the generation).
+/// then prints stats; ours streams generation to stdout and logs to stderr.
 fn extract_generated(stream: &str, is_python: bool) -> String {
     if is_python {
         let mut in_block = false;
         let mut out = String::new();
-        for l in stream.lines() {
-            if l.starts_with("==========") {
+        for line in stream.lines() {
+            if line.starts_with("==========") {
                 if in_block {
                     break;
                 }
@@ -78,27 +119,29 @@ fn extract_generated(stream: &str, is_python: bool) -> String {
                 if !out.is_empty() {
                     out.push('\n');
                 }
-                out.push_str(l);
+                out.push_str(line);
             }
         }
         out.trim().to_string()
     } else {
-        // Our binary writes log lines to stderr, generation to stdout.
         stream.trim().to_string()
     }
 }
 
 #[test]
-#[ignore = "requires python mlx_lm and a downloaded Qwen3-0.6B-bf16"]
+#[ignore = "requires python mlx_lm and a downloaded Qwen3 checkpoint"]
 fn greedy_matches_python() {
-    let py = run_python_greedy();
-    let rs = run_rust_greedy();
-    let py_n = extract_generated(&py, true);
-    let rs_n = extract_generated(&rs, false);
-    eprintln!("python: {py_n:?}");
-    eprintln!("rust:   {rs_n:?}");
+    let case = ParityCase::from_env();
+    let python = run_python_greedy(&case);
+    let rust = run_rust_greedy(&case);
+    let python_generated = extract_generated(&python, true);
+    let rust_generated = extract_generated(&rust, false);
+    eprintln!("model:  {:?}", case.model);
+    eprintln!("prompt: {:?}", case.prompt);
+    eprintln!("python: {python_generated:?}");
+    eprintln!("rust:   {rust_generated:?}");
     assert_eq!(
-        py_n, rs_n,
+        python_generated, rust_generated,
         "rust greedy output should match python mlx_lm.generate token-for-token"
     );
 }

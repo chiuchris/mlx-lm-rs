@@ -6,7 +6,7 @@ use mlx_rs::{
     fast::{self, ScaledDotProductAttentionMask},
     macros::ModuleParameters,
     module::{Module, ModuleParameters as _, ModuleParametersExt, Param},
-    nn::{self, Embedding, Linear, LinearBuilder, RmsNorm, RmsNormBuilder, Rope},
+    nn::{self, Embedding, Linear, LinearBuilder, RmsNorm, RmsNormBuilder},
     ops::{self, indexing::IndexOp},
     quantization::{MaybeQuantized, Quantizable},
     Array,
@@ -15,7 +15,7 @@ use mlx_rs::{
 use crate::cache::KvCache;
 use crate::config::Qwen3Config;
 use crate::error::Result;
-use crate::models::rope::build_rope;
+use crate::models::rope::{build_rope, Rope};
 
 type LinearLayer = MaybeQuantized<Linear>;
 type EmbeddingLayer = MaybeQuantized<EmbeddingModule>;
@@ -219,8 +219,8 @@ impl Attention {
         let k = self.k_norm.forward(&k)?;
 
         let offset = cache.as_ref().map(|c| c.offset()).unwrap_or(0);
-        let q = self.rope.forward(nn::RopeInput { x: &q, offset })?;
-        let k = self.rope.forward(nn::RopeInput { x: &k, offset })?;
+        let q = self.rope.forward(&q, offset)?;
+        let k = self.rope.forward(&k, offset)?;
 
         let (k, v) = match cache {
             Some(c) => c.update_and_fetch(k, v)?,

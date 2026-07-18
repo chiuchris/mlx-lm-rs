@@ -117,5 +117,22 @@ mod tests {
             .decode(&[198, 198, 5338, 11, 279, 1196, 1053, 25], false)
             .expect("decode ByteLevel generation fixture");
         assert_eq!(decoded, "\n\nFirst, the user said:");
+
+        let model_dir = std::env::var_os("MLX_LM_RS_TEST_MODEL_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("set MLX_LM_RS_TEST_MODEL_DIR to the checkpoint snapshot");
+        let template = crate::chat_template::ChatTemplate::load(model_dir)
+            .expect("load chat template")
+            .expect("checkpoint has a chat template");
+        let rendered = template
+            .render("Say hello in exactly five words.", true)
+            .expect("render Gate 2 fixture");
+        let encoding = tokenizer
+            .encode(rendered, false)
+            .expect("encode rendered Gate 2 fixture");
+        assert_eq!(
+            encoding.get_ids(),
+            &[151643, 151669, 45764, 14990, 258, 327, 32739, 69, 344, 365, 2260, 13, 151670,]
+        );
     }
 }

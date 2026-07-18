@@ -266,8 +266,9 @@ impl Model {
         let mut params = self.parameters_mut().flatten();
         let mut loaded_keys: HashSet<String> = HashSet::new();
 
-        for (param_key, _) in params.iter() {
-            let key = param_key.clone();
+        // Collect param names as owned Strings before iterating
+        let param_names: Vec<String> = params.keys().map(|k| k.to_string()).collect();
+        for key in param_names {
             let Some(weight) = tensors.remove(&key) else {
                 continue;
             };
@@ -278,7 +279,7 @@ impl Model {
                     .unwrap_or(weight),
                 _ => weight,
             };
-            if let Some(param) = params.get_mut(&key) {
+            if let Some(param) = params.get_mut(key.as_str()) {
                 **param = value;
                 loaded_keys.insert(key);
             }

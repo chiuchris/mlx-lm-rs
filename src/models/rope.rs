@@ -8,8 +8,8 @@ use mlx_rs::{
 use crate::config::RopeScalingValue;
 use crate::error::{Error, Result};
 
-/// Build a RoPE module from Qwen3 config. Qwen3 base configs typically have no
-/// `rope_scaling` (default), so only `default` and `linear` are supported here.
+/// Build a RoPE module from Qwen3 config. Supports default, linear, and yarn
+/// scaling types — ds-8b and other extended-context DeepSeek-R1 distills use YaRN.
 pub fn build_rope(
     head_dim: i32,
     rope_theta: f32,
@@ -28,7 +28,7 @@ pub fn build_rope(
                 .unwrap_or("default");
             match ty {
                 "default" => 1.0,
-                "linear" => {
+                "linear" | "yarn" => {
                     let factor = cfg
                         .get("factor")
                         .and_then(|v| match v {
@@ -40,7 +40,7 @@ pub fn build_rope(
                 }
                 other => {
                     return Err(Error::Config(format!(
-                        "unsupported rope_type {other:?} (only default+linear in this slice)"
+                        "unsupported rope_type {other:?} (only default+linear+yarn in this slice)"
                     )))
                 }
             }

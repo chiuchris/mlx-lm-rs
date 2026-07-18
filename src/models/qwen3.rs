@@ -1,9 +1,14 @@
+use std::iter::once;
+
 use mlx_rs::{
     builder::Builder,
+    error::Exception,
     fast::{self, ScaledDotProductAttentionMask},
     macros::ModuleParameters,
-    module::{Module, ModuleParameters as _, ModuleParametersExt},
+    module::{Module, ModuleParameters as _, ModuleParametersExt, Param},
     nn::{self, Embedding, Linear, LinearBuilder, RmsNorm, RmsNormBuilder, Rope},
+    ops::{self, indexing::IndexOp},
+    quantization::{MaybeQuantized, Quantizable},
     Array,
 };
 
@@ -12,8 +17,135 @@ use crate::config::Qwen3Config;
 use crate::error::Result;
 use crate::models::rope::build_rope;
 
-fn linear(in_dim: i32, out_dim: i32) -> Result<Linear> {
-    Ok(LinearBuilder::new(in_dim, out_dim).bias(false).build()?)
+type LinearLayer = MaybeQuantized<Linear>;
+type EmbeddingLayer = MaybeQuantized<EmbeddingModule>;
+
+#[derive(Debug, Clone, ModuleParameters)]
+pub struct EmbeddingModule {
+    #[param]
+    inner: Embedding,
+}
+
+impl EmbeddingModule {
+    fn new(embedding_count: i32, dimensions: i32) -> Result<Self> {
+        Ok(Self {
+            inner: Embedding::new(embedding_count, dimensions)?,
+        })
+    }
+
+    fn as_linear(&self, x: &Array) -> std::result::Result<Array, Exception> {
+        self.inner.as_linear(x)
+    }
+}
+
+impl Module<&Array> for EmbeddingModule {
+    type Error = Exception;
+    type Output = Array;
+
+    fn forward(&mut self, x: &Array) -> std::result::Result<Array, Self::Error> {
+        self.inner.forward(x)
+    }
+
+    fn training_mode(&mut self, mode: bool) {
+        self.inner.training_mode(mode);
+    }
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+pub struct PackedEmbedding {
+    group_size: i32,
+    bits: i32,
+    #[param]
+    scales: Param<Array>,
+    #[param]
+    biases: Param<Array>,
+    #[param]
+    inner: Embedding,
+}
+
+impl PackedEmbedding {
+    fn as_linear(&self, x: &Array) -> std::result::Result<Array, Exception> {
+        ops::quantized_matmul(
+            x,
+            &self.inner.weight,
+            &self.scales,
+            &self.biases,
+            true,
+            self.group_size,
+            self.bits,
+        )
+    }
+}
+
+impl Module<&Array> for PackedEmbedding {
+    type Error = Exception;
+    type Output = Array;
+
+    fn forward(&mut self, x: &Array) -> std::result::Result<Array, Self::Error> {
+        let shape = x.shape().to_vec();
+        let indices = x.flatten(None, None)?;
+        let weight = self.inner.weight.index(&indices);
+        let scales = self.scales.index(&indices);
+        let biases = self.biases.index(&indices);
+        let output = ops::dequantize(&weight, &scales, &biases, self.group_size, self.bits)?;
+        let output_shape = shape.into_iter().chain(once(-1)).collect::<Vec<_>>();
+        output.reshape(&output_shape)
+    }
+
+    fn training_mode(&mut self, mode: bool) {
+        self.inner.training_mode(mode);
+    }
+}
+
+impl Quantizable for EmbeddingModule {
+    type Quantized = PackedEmbedding;
+    type QuantizationError = Exception;
+
+    fn try_into_quantized(
+        self,
+        group_size: i32,
+        bits: i32,
+    ) -> std::result::Result<Self::Quantized, Self::QuantizationError> {
+        let quantized = nn::QuantizedEmbedding::try_from_embedding(self.inner, group_size, bits)?;
+        Ok(PackedEmbedding {
+            group_size: quantized.group_size,
+            bits: quantized.bits,
+            scales: quantized.scales,
+            biases: quantized.biases,
+            inner: quantized.inner,
+        })
+    }
+}
+
+fn linear(in_dim: i32, out_dim: i32, cfg: &Qwen3Config) -> Result<LinearLayer> {
+    let layer = MaybeQuantized::new(LinearBuilder::new(in_dim, out_dim).bias(false).build()?);
+    match cfg.quantization() {
+        Some(quantization) => Ok(nn::quantize(
+            layer,
+            quantization.group_size,
+            quantization.bits,
+        )?),
+        None => Ok(layer),
+    }
+}
+
+fn embedding(cfg: &Qwen3Config) -> Result<EmbeddingLayer> {
+    let layer = MaybeQuantized::new(EmbeddingModule::new(cfg.vocab_size, cfg.hidden_size)?);
+    match cfg.quantization() {
+        Some(quantization) => Ok(nn::quantize(
+            layer,
+            quantization.group_size,
+            quantization.bits,
+        )?),
+        None => Ok(layer),
+    }
+}
+
+fn embedding_as_linear(layer: &EmbeddingLayer, x: &Array) -> Result<Array> {
+    match layer {
+        MaybeQuantized::Original(embedding) => Ok(embedding.as_linear(x)?),
+        MaybeQuantized::Quantized(embedding) => Ok(embedding.as_linear(x)?),
+    }
 }
 
 fn rms(dim: i32, eps: f32) -> Result<RmsNorm> {
@@ -28,13 +160,13 @@ pub struct Attention {
     scale: f32,
 
     #[param]
-    q_proj: Linear,
+    q_proj: LinearLayer,
     #[param]
-    k_proj: Linear,
+    k_proj: LinearLayer,
     #[param]
-    v_proj: Linear,
+    v_proj: LinearLayer,
     #[param]
-    o_proj: Linear,
+    o_proj: LinearLayer,
     #[param]
     q_norm: RmsNorm,
     #[param]
@@ -54,10 +186,10 @@ impl Attention {
             n_kv_heads,
             head_dim,
             scale: (head_dim as f32).sqrt().recip(),
-            q_proj: linear(dim, n_heads * head_dim)?,
-            k_proj: linear(dim, n_kv_heads * head_dim)?,
-            v_proj: linear(dim, n_kv_heads * head_dim)?,
-            o_proj: linear(n_heads * head_dim, dim)?,
+            q_proj: linear(dim, n_heads * head_dim, cfg)?,
+            k_proj: linear(dim, n_kv_heads * head_dim, cfg)?,
+            v_proj: linear(dim, n_kv_heads * head_dim, cfg)?,
+            o_proj: linear(n_heads * head_dim, dim, cfg)?,
             q_norm: rms(head_dim, cfg.rms_norm_eps)?,
             k_norm: rms(head_dim, cfg.rms_norm_eps)?,
             rope: build_rope(head_dim, cfg.rope_theta, &cfg.rope_scaling)?,
@@ -107,19 +239,19 @@ impl Attention {
 #[derive(Debug, Clone, ModuleParameters)]
 pub struct Mlp {
     #[param]
-    gate_proj: Linear,
+    gate_proj: LinearLayer,
     #[param]
-    down_proj: Linear,
+    down_proj: LinearLayer,
     #[param]
-    up_proj: Linear,
+    up_proj: LinearLayer,
 }
 
 impl Mlp {
-    pub fn new(dim: i32, hidden: i32) -> Result<Self> {
+    pub fn new(cfg: &Qwen3Config) -> Result<Self> {
         Ok(Self {
-            gate_proj: linear(dim, hidden)?,
-            down_proj: linear(hidden, dim)?,
-            up_proj: linear(dim, hidden)?,
+            gate_proj: linear(cfg.hidden_size, cfg.intermediate_size, cfg)?,
+            down_proj: linear(cfg.intermediate_size, cfg.hidden_size, cfg)?,
+            up_proj: linear(cfg.hidden_size, cfg.intermediate_size, cfg)?,
         })
     }
 
@@ -147,7 +279,7 @@ impl TransformerBlock {
     pub fn new(cfg: &Qwen3Config) -> Result<Self> {
         Ok(Self {
             self_attn: Attention::new(cfg)?,
-            mlp: Mlp::new(cfg.hidden_size, cfg.intermediate_size)?,
+            mlp: Mlp::new(cfg)?,
             input_layernorm: rms(cfg.hidden_size, cfg.rms_norm_eps)?,
             post_attention_layernorm: rms(cfg.hidden_size, cfg.rms_norm_eps)?,
         })
@@ -168,7 +300,7 @@ impl TransformerBlock {
 #[derive(Debug, Clone, ModuleParameters)]
 pub struct Qwen3Backbone {
     #[param]
-    pub embed_tokens: Embedding,
+    pub embed_tokens: EmbeddingLayer,
     #[param]
     layers: Vec<TransformerBlock>,
     #[param]
@@ -181,7 +313,7 @@ impl Qwen3Backbone {
             .map(|_| TransformerBlock::new(cfg))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            embed_tokens: Embedding::new(cfg.vocab_size, cfg.hidden_size)?,
+            embed_tokens: embedding(cfg)?,
             layers,
             norm: rms(cfg.hidden_size, cfg.rms_norm_eps)?,
         })
@@ -209,7 +341,7 @@ pub struct Model {
     #[param]
     pub model: Qwen3Backbone,
     #[param]
-    lm_head: Option<Linear>,
+    lm_head: Option<LinearLayer>,
 }
 
 impl Model {
@@ -218,7 +350,7 @@ impl Model {
         let lm_head = if cfg.tie_word_embeddings {
             None
         } else {
-            Some(linear(cfg.hidden_size, cfg.vocab_size)?)
+            Some(linear(cfg.hidden_size, cfg.vocab_size, &cfg)?)
         };
         Ok(Self {
             config: cfg,
@@ -237,7 +369,7 @@ impl Model {
         let h = self.model.forward(tokens, cache)?;
         match &mut self.lm_head {
             Some(head) => Ok(head.forward(&h)?),
-            None => Ok(self.model.embed_tokens.as_linear(&h)?),
+            None => embedding_as_linear(&self.model.embed_tokens, &h),
         }
     }
 
@@ -249,15 +381,12 @@ impl Model {
         (0..self.n_layers()).map(|_| KvCache::new()).collect()
     }
 
-    /// Load all weight shards in one pass, with a *single* eval at the end.
-    /// Load all weight shards, dequantizing 4-bit checkpoints via mlx-rs.
-    ///
-    /// 4-bit safetensors ship companion `.scales` and `.biases` tensors.
-    /// `mlx_rs::ops::dequantize` reconstructs the float32 weight.
+    /// Load all weight shards in one pass, with a single eval at the end.
+    /// Quantized checkpoints stay packed and are consumed by mlx-rs fused
+    /// quantized embedding and matrix-multiplication operations.
     pub fn load_weights(&mut self, shards: &[std::path::PathBuf]) -> Result<()> {
         use std::collections::{HashMap, HashSet};
 
-        // Collect all tensors from all shards.
         let mut tensors: HashMap<String, Array> = HashMap::new();
         for shard in shards {
             tensors.extend(Array::load_safetensors(shard)?);
@@ -265,41 +394,35 @@ impl Model {
 
         let mut params = self.parameters_mut().flatten();
         let mut loaded_keys: HashSet<String> = HashSet::new();
+        let param_names: Vec<String> = params.keys().map(|key| key.to_string()).collect();
 
-        // Collect param names as owned Strings before iterating
-        let param_names: Vec<String> = params.keys().map(|k| k.to_string()).collect();
-        for key in param_names {
-            let Some(weight) = tensors.remove(&key) else {
+        for param_name in param_names {
+            let checkpoint_name = match param_name.strip_suffix(".inner.weight") {
+                Some(prefix) => format!("{prefix}.weight"),
+                None => param_name.clone(),
+            };
+            let Some(value) = tensors.remove(&checkpoint_name) else {
                 continue;
             };
-            let scales_key = format!("{key}.scales");
-            let biases_key = format!("{key}.biases");
-            let value = match (tensors.remove(&scales_key), tensors.remove(&biases_key)) {
-                (Some(s), Some(b)) => {
-                    match mlx_rs::ops::dequantize(&weight, &s, &b, 64, 4) {
-                        Ok(dq) => dq,
-                        Err(e) => {
-                            eprintln!("dequantize failed for {key}: {e:?}, falling back to raw weight");
-                            weight
-                        }
-                    }
-                }
-                _ => weight,
-            };
-            if let Some(param) = params.get_mut(key.as_str()) {
+            if let Some(param) = params.get_mut(param_name.as_str()) {
                 **param = value;
-                loaded_keys.insert(key);
+                loaded_keys.insert(param_name);
             }
         }
 
         let mut missing: Vec<String> = params
             .keys()
-            .map(|k| k.to_string())
-            .filter(|k| !loaded_keys.contains(k))
+            .map(|key| key.to_string())
+            .filter(|key| !loaded_keys.contains(key))
             .collect();
         if !missing.is_empty() {
             missing.sort();
-            let head = missing.iter().take(5).map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+            let head = missing
+                .iter()
+                .take(5)
+                .map(|key| key.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
             let tail = if missing.len() > 5 {
                 format!(" (+{} more)", missing.len() - 5)
             } else {

@@ -12,6 +12,12 @@ pub enum RopeScalingValue {
     Vec(Vec<f32>),
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct QuantizationConfig {
+    pub group_size: i32,
+    pub bits: i32,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Qwen3Config {
     pub model_type: String,
@@ -31,6 +37,18 @@ pub struct Qwen3Config {
     pub rope_scaling: Option<HashMap<String, RopeScalingValue>>,
     #[serde(default)]
     pub eos_token_id: Option<EosTokenId>,
+    #[serde(default)]
+    pub quantization: Option<QuantizationConfig>,
+    #[serde(default)]
+    pub quantization_config: Option<QuantizationConfig>,
+}
+
+impl Qwen3Config {
+    pub fn quantization(&self) -> Option<&QuantizationConfig> {
+        self.quantization
+            .as_ref()
+            .or(self.quantization_config.as_ref())
+    }
 }
 
 fn default_tie() -> bool {
@@ -62,6 +80,20 @@ pub fn load_config(model_dir: impl AsRef<Path>) -> Result<Qwen3Config> {
             "expected model_type=qwen3, got {}",
             cfg.model_type
         )));
+    }
+    if let Some(quantization) = cfg.quantization() {
+        if quantization.group_size <= 0 {
+            return Err(Error::Config(format!(
+                "quantization group_size must be positive, got {}",
+                quantization.group_size
+            )));
+        }
+        if !matches!(quantization.bits, 2 | 4 | 8) {
+            return Err(Error::Config(format!(
+                "quantization bits must be 2, 4, or 8, got {}",
+                quantization.bits
+            )));
+        }
     }
     Ok(cfg)
 }

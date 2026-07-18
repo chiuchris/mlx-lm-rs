@@ -250,48 +250,54 @@ impl Model {
     }
 
     /// Load all weight shards in one pass, with a *single* eval at the end.
+    /// Load all weight shards, dequantizing 4-bit checkpoints via mlx-rs.
     ///
-    /// `mlx_rs::module::ModuleParametersExt::load_safetensors` calls
-    /// `self.eval()` after every file, which forces N intermediate
-    /// materializations for an N-shard model. We do the parameter
-    /// assignments shard-by-shard ourselves, then eval once.
-    ///
-    /// Errors if any expected parameter wasn't covered by the shards — a
-    /// missing weight would otherwise leave a randomly-initialized tensor
-    /// in place and produce silent garbage at inference time.
+    /// 4-bit safetensors ship companion `.scales` and `.biases` tensors.
+    /// `mlx_rs::ops::dequantize` reconstructs the float32 weight.
     pub fn load_weights(&mut self, shards: &[std::path::PathBuf]) -> Result<()> {
-        use std::collections::HashSet;
+        use std::collections::{HashMap, HashSet};
+
+        // Collect all tensors from all shards.
+        let mut tensors: HashMap<String, Array> = HashMap::new();
+        for shard in shards {
+            tensors.extend(Array::load_safetensors(shard)?);
+        }
+
+        let mut params = self.parameters_mut().flatten();
         let mut loaded_keys: HashSet<String> = HashSet::new();
-        {
-            let mut params = self.parameters_mut().flatten();
-            for shard in shards {
-                let loaded = Array::load_safetensors(shard)?;
-                for (key, value) in loaded {
-                    if let Some(param) = params.get_mut(&*key) {
-                        **param = value;
-                        loaded_keys.insert(key);
-                    }
-                }
+
+        for (param_key, _) in params.iter() {
+            let key = param_key.clone();
+            let Some(weight) = tensors.remove(&key) else {
+                continue;
+            };
+            let scales_key = format!("{key}.scales");
+            let biases_key = format!("{key}.biases");
+            let value = match (tensors.remove(&scales_key), tensors.remove(&biases_key)) {
+                (Some(s), Some(b)) => mlx_rs::ops::dequantize(&weight, &s, &b, 64, 4)
+                    .unwrap_or(weight),
+                _ => weight,
+            };
+            if let Some(param) = params.get_mut(&key) {
+                **param = value;
+                loaded_keys.insert(key);
             }
-            let mut missing: Vec<&str> = params
-                .keys()
-                .filter_map(|k| (!loaded_keys.contains(&**k)).then_some(&**k))
-                .collect();
-            if !missing.is_empty() {
-                missing.sort();
-                let head = missing
-                    .iter()
-                    .take(5)
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let tail = if missing.len() > 5 {
-                    format!(" (+{} more)", missing.len() - 5)
-                } else {
-                    String::new()
-                };
-                return Err(crate::error::Error::MissingWeight(format!("{head}{tail}")));
-            }
+        }
+
+        let mut missing: Vec<&str> = params
+            .keys()
+            .filter(|k| !loaded_keys.contains(&**k))
+            .map(|k| &**k)
+            .collect();
+        if !missing.is_empty() {
+            missing.sort();
+            let head = missing.iter().take(5).copied().collect::<Vec<_>>().join(", ");
+            let tail = if missing.len() > 5 {
+                format!(" (+{} more)", missing.len() - 5)
+            } else {
+                String::new()
+            };
+            return Err(crate::error::Error::MissingWeight(format!("{head}{tail}")));
         }
         self.eval()?;
         Ok(())

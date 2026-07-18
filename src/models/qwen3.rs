@@ -275,8 +275,15 @@ impl Model {
             let scales_key = format!("{key}.scales");
             let biases_key = format!("{key}.biases");
             let value = match (tensors.remove(&scales_key), tensors.remove(&biases_key)) {
-                (Some(s), Some(b)) => mlx_rs::ops::dequantize(&weight, &s, &b, 64, 4)
-                    .unwrap_or(weight),
+                (Some(s), Some(b)) => {
+                    match mlx_rs::ops::dequantize(&weight, &s, &b, 64, 4) {
+                        Ok(dq) => dq,
+                        Err(e) => {
+                            eprintln!("dequantize failed for {key}: {e:?}, falling back to raw weight");
+                            weight
+                        }
+                    }
+                }
                 _ => weight,
             };
             if let Some(param) = params.get_mut(key.as_str()) {

@@ -40,10 +40,30 @@ impl<'a> Generator<'a> {
         eos_ids: Vec<u32>,
         prefill_step_size: NonZeroUsize,
     ) -> Result<Self> {
+        let cache = model.make_cache();
+        Self::new_with_cache(
+            model,
+            prompt_ids,
+            cache,
+            max_tokens,
+            temp,
+            eos_ids,
+            prefill_step_size,
+        )
+    }
+
+    pub fn new_with_cache(
+        model: &'a mut Model,
+        prompt_ids: &[u32],
+        mut cache: Vec<KvCache>,
+        max_tokens: usize,
+        temp: f32,
+        eos_ids: Vec<u32>,
+        prefill_step_size: NonZeroUsize,
+    ) -> Result<Self> {
         if prompt_ids.is_empty() {
             return Err(Error::Config("empty prompt".into()));
         }
-        let mut cache = model.make_cache();
 
         let split = prompt_ids.len() - 1;
         let step = prefill_step_size.get();
@@ -91,6 +111,10 @@ impl<'a> Generator<'a> {
             pending,
         })
     }
+
+    pub fn into_cache(self) -> Vec<KvCache> {
+        self.cache
+    }
 }
 
 /// One decode pass: model forward + sample. Returns the (unmaterialized)
@@ -115,27 +139,21 @@ impl Iterator for Generator<'_> {
         }
         let cur = self.pending.take()?;
 
-        // While the GPU finishes computing `cur`, build the *next* step's
-        // graph on the host using `cur` as an unmaterialized input. Then
-        // kick off its async eval. By the time we call `cur.item()` below,
-        // both steps are scheduled and the GPU has been busy for two ticks.
-        let next_pending = if self.produced + 1 < self.max_tokens {
-            // `cur` is shape [1] from argmax/categorical; the model wants [1, 1].
-            let input = match cur.reshape(&[1, 1]) {
-                Ok(x) => x,
-                Err(e) => return Some(Err(e.into())),
-            };
-            let next = match step_decode(self.model, &mut self.cache, &input, self.temp) {
-                Ok(t) => t,
-                Err(e) => return Some(Err(e)),
-            };
-            if let Err(e) = async_eval(std::iter::once(&next)) {
-                return Some(Err(e.into()));
-            }
-            Some(next)
-        } else {
-            None
+        // Python mlx-lm always builds one lookahead step before yielding the
+        // current token, including at the generation cap. Besides overlapping
+        // host/GPU work, this leaves every yielded token represented in cache.
+        let input = match cur.reshape(&[1, 1]) {
+            Ok(x) => x,
+            Err(e) => return Some(Err(e.into())),
         };
+        let next = match step_decode(self.model, &mut self.cache, &input, self.temp) {
+            Ok(t) => t,
+            Err(e) => return Some(Err(e)),
+        };
+        if let Err(e) = async_eval(std::iter::once(&next)) {
+            return Some(Err(e.into()));
+        }
+        self.pending = Some(next);
 
         // `.item()` blocks until materialization. Most of that wait already
         // happened during the next-step graph build above.
@@ -149,7 +167,6 @@ impl Iterator for Generator<'_> {
         if self.eos_ids.contains(&tok) {
             return None;
         }
-        self.pending = next_pending;
         Some(Ok(tok))
     }
 }

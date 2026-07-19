@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use mlx_rs::{
     ops::{
         concatenate_axis,
@@ -19,7 +21,7 @@ const STEP: i32 = 256;
 /// underlying buffer is rounded up to the next `STEP`-token boundary. When
 /// the active region exceeds the buffer, we extend by `ceil(n_new / STEP)`
 /// chunks (the existing buffer is `concatenate`d with a fresh zeros block).
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct KvCache {
     keys: Option<Array>,
     values: Option<Array>,
@@ -33,6 +35,12 @@ impl KvCache {
 
     pub fn offset(&self) -> i32 {
         self.offset
+    }
+
+    pub fn trim(&mut self, count: usize) -> usize {
+        let trimmed = count.min(self.offset as usize);
+        self.offset -= trimmed as i32;
+        trimmed
     }
 
     /// Active K/V slice views (shape `[B, H, offset, D]`) — i.e. the meaningful
@@ -101,6 +109,97 @@ impl KvCache {
     }
 }
 
+#[derive(Debug)]
+struct PromptCacheEntry {
+    tokens: Vec<u32>,
+    cache: Vec<KvCache>,
+}
+
+#[derive(Debug)]
+pub struct PromptCache {
+    entries: VecDeque<PromptCacheEntry>,
+    max_size: usize,
+}
+
+impl PromptCache {
+    pub fn new(max_size: usize) -> Self {
+        assert!(max_size > 0, "prompt cache max_size must be positive");
+        Self {
+            entries: VecDeque::new(),
+            max_size,
+        }
+    }
+
+    pub fn fetch_nearest(&self, tokens: &[u32]) -> (Option<Vec<KvCache>>, Vec<u32>) {
+        if let Some(entry) = self.entries.iter().find(|entry| entry.tokens == tokens) {
+            return (Some(entry.cache.clone()), Vec::new());
+        }
+        if tokens.is_empty() {
+            return (None, Vec::new());
+        }
+
+        let shorter = self
+            .entries
+            .iter()
+            .filter(|entry| entry.tokens.len() > 1 && tokens.starts_with(&entry.tokens))
+            .max_by_key(|entry| entry.tokens.len());
+        let shorter_len = shorter.map_or(0, |entry| entry.tokens.len());
+
+        let mut common_prefix = 0;
+        let mut longer: Option<&PromptCacheEntry> = None;
+        for entry in &self.entries {
+            let prefix = common_prefix_len(tokens, &entry.tokens);
+            if prefix == 0 {
+                continue;
+            }
+            let prefer = prefix > common_prefix
+                || (prefix == common_prefix
+                    && longer.is_none_or(|current| entry.tokens.len() < current.tokens.len()));
+            if prefer {
+                common_prefix = prefix;
+                longer = Some(entry);
+            }
+        }
+
+        if let Some(entry) = longer.filter(|_| common_prefix > shorter_len) {
+            let prefix = (tokens.len() - 1).min(common_prefix);
+            let mut cache = entry.cache.clone();
+            let trim = entry.tokens.len() - prefix;
+            for layer in &mut cache {
+                layer.trim(trim);
+            }
+            return (Some(cache), tokens[prefix..].to_vec());
+        }
+
+        if let Some(entry) = shorter {
+            return (
+                Some(entry.cache.clone()),
+                tokens[entry.tokens.len()..].to_vec(),
+            );
+        }
+
+        (None, tokens.to_vec())
+    }
+
+    pub fn insert(&mut self, tokens: Vec<u32>, cache: Vec<KvCache>) {
+        self.entries.retain(|entry| entry.tokens != tokens);
+        self.entries.retain(|entry| {
+            entry.tokens.len() >= tokens.len() || !tokens.starts_with(&entry.tokens)
+        });
+        self.entries.push_back(PromptCacheEntry { tokens, cache });
+        while self.entries.len() > self.max_size {
+            self.entries.pop_front();
+        }
+    }
+}
+
+fn common_prefix_len(left: &[u32], right: &[u32]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
 fn extend(existing: Option<&Array>, pad: Array, prev: i32, trim_tail: bool) -> Result<Array> {
     match existing {
         None => Ok(pad),
@@ -112,5 +211,55 @@ fn extend(existing: Option<&Array>, pad: Array, prev: i32, trim_tail: bool) -> R
             };
             Ok(concatenate_axis(&[head, pad], -2)?)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cache_with_offset(offset: i32) -> Vec<KvCache> {
+        vec![KvCache {
+            keys: None,
+            values: None,
+            offset,
+        }]
+    }
+
+    #[test]
+    fn prompt_cache_fetches_exact_and_shorter_entries() {
+        let mut cache = PromptCache::new(10);
+        cache.insert(vec![1, 2], cache_with_offset(2));
+
+        let (exact, exact_rest) = cache.fetch_nearest(&[1, 2]);
+        assert!(exact_rest.is_empty());
+        assert_eq!(exact.unwrap()[0].offset(), 2);
+
+        let (shorter, shorter_rest) = cache.fetch_nearest(&[1, 2, 3]);
+        assert_eq!(shorter_rest, [3]);
+        assert_eq!(shorter.unwrap()[0].offset(), 2);
+    }
+
+    #[test]
+    fn prompt_cache_trims_longer_entry_but_preserves_hidden_preseed_token() {
+        let mut cache = PromptCache::new(10);
+        cache.insert(vec![1, 2, 3, 4], cache_with_offset(5));
+
+        let (nearest, rest) = cache.fetch_nearest(&[1, 2, 9]);
+        assert_eq!(rest, [9]);
+        assert_eq!(nearest.unwrap()[0].offset(), 3);
+    }
+
+    #[test]
+    fn prompt_cache_removes_prefixes_and_evicts_oldest_entry() {
+        let mut cache = PromptCache::new(2);
+        cache.insert(vec![1, 2], cache_with_offset(2));
+        cache.insert(vec![1, 2, 3], cache_with_offset(3));
+        assert_eq!(cache.entries.len(), 1);
+
+        cache.insert(vec![4], cache_with_offset(1));
+        cache.insert(vec![5], cache_with_offset(1));
+        assert_eq!(cache.entries.len(), 2);
+        assert!(cache.fetch_nearest(&[1, 2, 3]).0.is_none());
     }
 }

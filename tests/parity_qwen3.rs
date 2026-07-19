@@ -169,7 +169,7 @@ fn ds8_greedy_matches_python_token_oracle() {
         2578, 387, 264, 85105, 476, 36204, 5326, 311, 387, 15676, 382, 40, 1184, 311, 14198, 419,
         13, 1084, 1410, 387, 330, 45764, 23811, 304, 6896, 4236, 4244, 1189, 476, 2494, 4428, 13,
     ];
-    let actual = Generator::new(
+    let mut generator = Generator::new(
         &mut model,
         PROMPT,
         EXPECTED_GENERATION.len(),
@@ -177,8 +177,17 @@ fn ds8_greedy_matches_python_token_oracle() {
         vec![151645],
         NonZeroUsize::new(2048).unwrap(),
     )
-    .expect("construct generator")
-    .collect::<Result<Vec<_>, _>>()
-    .expect("greedy generation");
+    .expect("construct generator");
+    let actual = generator
+        .by_ref()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("greedy generation");
     assert_eq!(actual, EXPECTED_GENERATION);
+
+    let cache = generator.into_cache();
+    let expected_offset = (PROMPT.len() + EXPECTED_GENERATION.len()) as i32;
+    assert!(
+        cache.iter().all(|layer| layer.offset() == expected_offset),
+        "all yielded tokens must be represented in reusable cache state"
+    );
 }

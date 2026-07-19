@@ -6,7 +6,7 @@ use mlx_rs::{
     module::Module,
     nn::{self, Rope as StandardRope, RopeBuilder},
     ops::{
-        concatenate_axis,
+        clip, concatenate_axis,
         indexing::{Ellipsis, IndexOp},
     },
     Array,
@@ -79,11 +79,11 @@ impl YarnRope {
         let scaled = if self.mscale == 1.0 {
             x.clone()
         } else if self.dims == last_dim {
-            x.multiply(Array::from_f32(self.mscale))?
+            x.multiply(Array::from_f32(self.mscale).as_dtype(x.dtype())?)?
         } else {
             let rotary = x
                 .index((Ellipsis, 0..self.dims))
-                .multiply(Array::from_f32(self.mscale))?;
+                .multiply(Array::from_f32(self.mscale).as_dtype(x.dtype())?)?;
             let pass_through = x.index((Ellipsis, self.dims..last_dim));
             concatenate_axis(&[rotary, pass_through], -1)?
         };
@@ -126,8 +126,7 @@ pub fn build_rope(
             Ok(Rope(RopeKind::Standard(rope)))
         }
         Scaling::Yarn(parameters) => {
-            let values = yarn_frequencies(head_dim, rope_theta, &parameters);
-            let freqs = Array::from_slice(&values, &[values.len() as i32]);
+            let freqs = yarn_frequencies(head_dim, rope_theta, &parameters)?;
             let mscale = yarn_get_mscale(parameters.factor, parameters.mscale)
                 / yarn_get_mscale(parameters.factor, parameters.mscale_all_dim);
             Ok(Rope(RopeKind::Yarn(YarnRope {
@@ -266,7 +265,7 @@ fn yarn_get_mscale(scale: f32, mscale: f32) -> f32 {
     }
 }
 
-fn yarn_frequencies(dims: i32, base: f32, parameters: &YarnParameters) -> Vec<f32> {
+fn yarn_frequencies(dims: i32, base: f32, parameters: &YarnParameters) -> Result<Array> {
     let (low, high) = yarn_correction_range(dims, base, parameters);
     let max_ramp = if low == high {
         high as f32 + 0.001
@@ -274,15 +273,18 @@ fn yarn_frequencies(dims: i32, base: f32, parameters: &YarnParameters) -> Vec<f3
         high as f32
     };
 
-    (0..dims / 2)
-        .map(|index| {
-            let ramp = ((index as f32 - low as f32) / (max_ramp - low as f32)).clamp(0.0, 1.0);
-            let freq_extra = base.powf((2 * index) as f32 / dims as f32);
-            let freq_inter = parameters.factor * freq_extra;
-            let freq_mask = 1.0 - ramp;
-            (freq_inter * freq_extra) / (freq_inter * freq_mask + freq_extra * (1.0 - freq_mask))
-        })
-        .collect()
+    let exponents = Array::arange::<_, f32>(0, dims, 2)?.divide(Array::from_f32(dims as f32))?;
+    let freq_extra = Array::from_f32(base).power(&exponents)?;
+    let freq_inter = Array::from_f32(parameters.factor).multiply(&freq_extra)?;
+    let ramp = Array::arange::<_, f32>(0, dims / 2, None)?
+        .subtract(Array::from_f32(low as f32))?
+        .divide(Array::from_f32(max_ramp - low as f32))?;
+    let freq_mask = Array::from_f32(1.0).subtract(clip(&ramp, (0.0, 1.0))?)?;
+    let numerator = freq_inter.multiply(&freq_extra)?;
+    let denominator = freq_inter
+        .multiply(&freq_mask)?
+        .add(&freq_extra.multiply(Array::from_f32(1.0).subtract(&freq_mask)?)?)?;
+    Ok(numerator.divide(&denominator)?)
 }
 
 #[cfg(test)]
@@ -317,18 +319,27 @@ mod tests {
     }
 
     #[test]
-    fn yarn_matches_python_selected_frequencies() {
-        let frequencies = yarn_frequencies(128, 1_000_000.0, &yarn_parameters());
-        assert_eq!(frequencies.len(), 64);
-        for (index, expected) in [
-            (0, 1.0),
-            (22, 115.478_195),
-            (30, 939.530_94),
-            (40, 22_493.652),
-            (63, 3_223_368.8),
-        ] {
-            assert_close(frequencies[index], expected);
-        }
+    fn yarn_matches_python_frequency_bits() {
+        let frequencies =
+            yarn_frequencies(128, 1_000_000.0, &yarn_parameters()).expect("build YaRN frequencies");
+        let actual = frequencies
+            .as_slice::<f32>()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+        let expected = [
+            0x3f800000, 0x3f9ed70c, 0x3fc51c50, 0x3ff49a1b, 0x4017c496, 0x403c55a5, 0x4069b621,
+            0x409102bc, 0x40b3f300, 0x40df4e48, 0x410a8de7, 0x412beff0, 0x41555d09, 0x418462a8,
+            0x41a44832, 0x41cbdd1f, 0x41fcfb72, 0x421cf7b5, 0x4242c979, 0x4271b7f4, 0x4295fa95,
+            0x42ba1d4b, 0x42e6f4d6, 0x430f4d1f, 0x433a090f, 0x43720768, 0x439dcea7, 0x43ce51dc,
+            0x440742da, 0x4431ebf3, 0x446ae1fb, 0x449bac8f, 0x44cf512c, 0x450aca02, 0x453afdb9,
+            0x457dcc68, 0x45adc3b3, 0x45f082e9, 0x4628b1d0, 0x4670bd8c, 0x46afbb4e, 0x46da1273,
+            0x47074e93, 0x4727e851, 0x47505cdc, 0x47814858, 0x47a06e81, 0x47c715f0, 0x47f70d8e,
+            0x481949e6, 0x483e38c1, 0x486c0da4, 0x489276b6, 0x48b5c09b, 0x48e18b1a, 0x490bf150,
+            0x492da8fc, 0x4957805b, 0x4985b63f, 0x49a5ed9b, 0x49cde812, 0x49ff8464, 0x4a1e8a5b,
+            0x4a44bd24,
+        ];
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -337,6 +348,38 @@ mod tests {
         let mscale = yarn_get_mscale(parameters.factor, parameters.mscale)
             / yarn_get_mscale(parameters.factor, parameters.mscale_all_dim);
         assert_close(mscale, 1.138_629_4);
+    }
+
+    #[test]
+    fn yarn_matches_python_bfloat16_output_bits() {
+        let parameters = yarn_parameters();
+        let mscale = yarn_get_mscale(parameters.factor, parameters.mscale)
+            / yarn_get_mscale(parameters.factor, parameters.mscale_all_dim);
+        let rope = YarnRope {
+            dims: 128,
+            mscale,
+            freqs: yarn_frequencies(128, 1_000_000.0, &parameters).expect("build YaRN frequencies"),
+        };
+        let input = Array::arange::<_, f32>(0, 256, None)
+            .expect("build input")
+            .subtract(Array::from_f32(128.0))
+            .expect("center input")
+            .divide(Array::from_f32(31.0))
+            .expect("scale input")
+            .as_dtype(mlx_rs::Dtype::Bfloat16)
+            .expect("cast input")
+            .reshape(&[1, 2, 1, 128])
+            .expect("reshape input");
+        let output = rope.forward(&input, 46).expect("apply YaRN");
+        let bits = output
+            .view_dtype(mlx_rs::Dtype::Uint16)
+            .expect("view BF16 bits");
+        let expected = [
+            16517, 49316, 49178, 49287, 49200, 16534, 49294, 16378, 16471, 49252, 49283, 15612,
+            16478, 16532, 16513, 16430, 16291, 15133, 49021, 49120, 49172, 49198, 49216, 49229,
+            49239, 49245, 49249, 49251, 49251, 49251, 49250, 49249,
+        ];
+        assert_eq!(&bits.as_slice::<u16>()[..expected.len()], &expected);
     }
 
     #[test]

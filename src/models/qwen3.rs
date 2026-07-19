@@ -69,7 +69,7 @@ impl PackedEmbedding {
             x,
             &self.inner.weight,
             &self.scales,
-            &self.biases,
+            &*self.biases,
             true,
             self.group_size,
             self.bits,
@@ -205,18 +205,16 @@ impl Attention {
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
-        let q = q
-            .reshape(&[b, l, self.n_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let k = k
-            .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+        let q = q.reshape(&[b, l, self.n_heads, self.head_dim])?;
+        let k = k.reshape(&[b, l, self.n_kv_heads, self.head_dim])?;
         let v = v
             .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
         let q = self.q_norm.forward(&q)?;
         let k = self.k_norm.forward(&k)?;
+        let q = q.transpose_axes(&[0, 2, 1, 3])?;
+        let k = k.transpose_axes(&[0, 2, 1, 3])?;
 
         let offset = cache.as_ref().map(|c| c.offset()).unwrap_or(0);
         let q = self.rope.forward(&q, offset)?;
@@ -230,7 +228,7 @@ impl Attention {
         // Causal mask only needed when q_len > 1 (prefill); decode's single
         // query attends only to past keys by construction.
         let mask = (l > 1).then_some(ScaledDotProductAttentionMask::Causal);
-        let out = fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask)?;
+        let out = fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask, None)?;
         let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, l, -1])?;
         Ok(self.o_proj.forward(&out)?)
     }
@@ -432,5 +430,326 @@ impl Model {
         }
         self.eval()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::load_config, loader::list_weight_files};
+
+    fn bf16_hash(array: &Array) -> u64 {
+        array
+            .flatten(None, None)
+            .expect("flatten BF16 values")
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .expect("copy BF16 values")
+            .as_dtype(mlx_rs::Dtype::Bfloat16)
+            .expect("restore BF16 values")
+            .view_dtype(mlx_rs::Dtype::Uint16)
+            .expect("view BF16 bits")
+            .as_slice::<u16>()
+            .iter()
+            .fold(0xcbf29ce484222325_u64, |state, value| {
+                (state ^ u64::from(*value)).wrapping_mul(0x100000001b3)
+            })
+    }
+
+    #[test]
+    #[ignore = "requires MLX_LM_RS_TEST_MODEL_DIR"]
+    fn ds8_layer0_intermediates_match_python_bits() {
+        let model_dir = std::env::var_os("MLX_LM_RS_TEST_MODEL_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("set MLX_LM_RS_TEST_MODEL_DIR to the checkpoint snapshot");
+        let config = load_config(&model_dir).expect("load config");
+        let mut model = Model::new(config).expect("construct model");
+        let shards = list_weight_files(&model_dir).expect("list weights");
+        model.load_weights(&shards).expect("load weights");
+
+        let token = Array::from_slice(&[387_u32], &[1, 1]);
+        let embed = model
+            .model
+            .embed_tokens
+            .forward(&token)
+            .expect("embed token");
+        let layer = &mut model.model.layers[0];
+        let norm = layer.input_layernorm.forward(&embed).expect("input norm");
+        let q = layer.self_attn.q_proj.forward(&norm).expect("q projection");
+        let k = layer.self_attn.k_proj.forward(&norm).expect("k projection");
+        let v = layer.self_attn.v_proj.forward(&norm).expect("v projection");
+        let qnorm = layer
+            .self_attn
+            .q_norm
+            .forward(&q.reshape(&[1, 1, 32, 128]).expect("reshape q"))
+            .expect("q norm")
+            .transpose_axes(&[0, 2, 1, 3])
+            .expect("transpose q");
+        let knorm = layer
+            .self_attn
+            .k_norm
+            .forward(&k.reshape(&[1, 1, 8, 128]).expect("reshape k"))
+            .expect("k norm")
+            .transpose_axes(&[0, 2, 1, 3])
+            .expect("transpose k");
+        let krope_zero = layer
+            .self_attn
+            .rope
+            .forward(&knorm, 0)
+            .expect("apply rope at offset zero");
+        let krope = layer
+            .self_attn
+            .rope
+            .forward(&knorm, 46)
+            .expect("apply rope");
+        let single_value = v
+            .reshape(&[1, 1, 8, 128])
+            .expect("reshape v")
+            .transpose_axes(&[0, 2, 1, 3])
+            .expect("transpose v");
+
+        let actual = [
+            ("embed", bf16_hash(&embed)),
+            ("norm", bf16_hash(&norm)),
+            ("q", bf16_hash(&q)),
+            ("k", bf16_hash(&k)),
+            ("v", bf16_hash(&v)),
+            ("qnorm", bf16_hash(&qnorm)),
+            ("knorm", bf16_hash(&knorm)),
+            ("krope_zero", bf16_hash(&krope_zero)),
+            ("krope", bf16_hash(&krope)),
+            ("value", bf16_hash(&single_value)),
+        ];
+        let expected = [
+            ("embed", 0x1dc119f48e844974),
+            ("norm", 0x491388f13a1a9877),
+            ("q", 0xc4ba062602b40fa8),
+            ("k", 0xe0644aebe940e540),
+            ("v", 0xe5073d4a5312339f),
+            ("qnorm", 0xa75015074680f1e1),
+            ("knorm", 0xac19672b30f07960),
+            ("krope_zero", 0x08253d7535037885),
+            ("krope", 0xfda4637578980328),
+            ("value", 0xe5073d4a5312339f),
+        ];
+        assert_eq!(actual, expected);
+
+        let prefill = Array::from_slice(
+            &[
+                151643_u32, 151669, 45764, 14990, 258, 327, 32739, 69, 344, 365, 2260, 13,
+            ],
+            &[1, 12],
+        );
+        let embed = model
+            .model
+            .embed_tokens
+            .forward(&prefill)
+            .expect("embed prefill");
+        let layer = &mut model.model.layers[0];
+        let norm = layer
+            .input_layernorm
+            .forward(&embed)
+            .expect("prefill input norm");
+        let q = layer.self_attn.q_proj.forward(&norm).expect("prefill q");
+        let k = layer.self_attn.k_proj.forward(&norm).expect("prefill k");
+        let v = layer.self_attn.v_proj.forward(&norm).expect("prefill v");
+        let qnorm = layer
+            .self_attn
+            .q_norm
+            .forward(&q.reshape(&[1, 12, 32, 128]).expect("reshape prefill q"))
+            .expect("prefill q norm")
+            .transpose_axes(&[0, 2, 1, 3])
+            .expect("transpose prefill q");
+        let knorm = layer
+            .self_attn
+            .k_norm
+            .forward(&k.reshape(&[1, 12, 8, 128]).expect("reshape prefill k"))
+            .expect("prefill k norm")
+            .transpose_axes(&[0, 2, 1, 3])
+            .expect("transpose prefill k");
+        let krope = layer
+            .self_attn
+            .rope
+            .forward(&knorm, 0)
+            .expect("prefill rope");
+        let value = v
+            .reshape(&[1, 12, 8, 128])
+            .expect("reshape prefill v")
+            .transpose_axes(&[0, 2, 1, 3])
+            .expect("transpose prefill v");
+        assert_eq!(
+            [
+                ("embed", bf16_hash(&embed)),
+                ("norm", bf16_hash(&norm)),
+                ("q", bf16_hash(&q)),
+                ("k", bf16_hash(&k)),
+                ("v", bf16_hash(&v)),
+                ("qnorm", bf16_hash(&qnorm)),
+                ("knorm", bf16_hash(&knorm)),
+                ("krope", bf16_hash(&krope)),
+                ("value", bf16_hash(&value)),
+            ],
+            [
+                ("embed", 0xf942f12184d85c0c),
+                ("norm", 0x94b076813d563f7f),
+                ("q", 0x15a395dc6e6fc2c2),
+                ("k", 0x2fa943f1cbfc5c50),
+                ("v", 0xe515362796f37613),
+                ("qnorm", 0x513065e73313900f),
+                ("knorm", 0x94798588402a2139),
+                ("krope", 0x0618b2e09a652eb3),
+                ("value", 0xd82b8f1b2eac18c3),
+            ]
+        );
+
+        let full_prefix = Array::from_slice(
+            &[
+                151643_u32, 151669, 45764, 14990, 258, 327, 32739, 69, 344, 365, 2260, 13, 151670,
+                151667,
+            ],
+            &[1, 14],
+        );
+        let embed = model
+            .model
+            .embed_tokens
+            .forward(&full_prefix)
+            .expect("embed full prefix");
+        let norm = layer
+            .input_layernorm
+            .forward(&embed)
+            .expect("full-prefix input norm");
+        let q = layer
+            .self_attn
+            .q_proj
+            .forward(&norm)
+            .expect("full-prefix q");
+        let k = layer
+            .self_attn
+            .k_proj
+            .forward(&norm)
+            .expect("full-prefix k");
+        let v = layer
+            .self_attn
+            .v_proj
+            .forward(&norm)
+            .expect("full-prefix v");
+        let qnorm = layer
+            .self_attn
+            .q_norm
+            .forward(&q.reshape(&[1, 14, 32, 128]).expect("reshape full-prefix q"))
+            .expect("full-prefix q norm")
+            .transpose_axes(&[0, 2, 1, 3])
+            .expect("transpose full-prefix q");
+        let knorm = layer
+            .self_attn
+            .k_norm
+            .forward(&k.reshape(&[1, 14, 8, 128]).expect("reshape full-prefix k"))
+            .expect("full-prefix k norm")
+            .transpose_axes(&[0, 2, 1, 3])
+            .expect("transpose full-prefix k");
+        let qrope = layer
+            .self_attn
+            .rope
+            .forward(&qnorm, 0)
+            .expect("full-prefix q rope");
+        let krope = layer
+            .self_attn
+            .rope
+            .forward(&knorm, 0)
+            .expect("full-prefix k rope");
+        let value = v
+            .reshape(&[1, 14, 8, 128])
+            .expect("reshape full-prefix v")
+            .transpose_axes(&[0, 2, 1, 3])
+            .expect("transpose full-prefix v");
+        assert_eq!(
+            (qrope.dtype(), krope.dtype(), value.dtype()),
+            (
+                mlx_rs::Dtype::Bfloat16,
+                mlx_rs::Dtype::Bfloat16,
+                mlx_rs::Dtype::Bfloat16,
+            )
+        );
+        assert_eq!(layer.self_attn.scale.to_bits(), 0x3db5_04f3);
+        let sdpa = fast::scaled_dot_product_attention(
+            &qrope,
+            &krope,
+            &value,
+            layer.self_attn.scale,
+            ScaledDotProductAttentionMask::Causal,
+            None,
+        )
+        .expect("full-prefix SDPA");
+        let flat = sdpa
+            .transpose_axes(&[0, 2, 1, 3])
+            .expect("transpose full-prefix SDPA")
+            .reshape(&[1, 14, 4096])
+            .expect("flatten full-prefix SDPA");
+        let out = layer
+            .self_attn
+            .o_proj
+            .forward(&flat)
+            .expect("full-prefix attention output");
+        assert_eq!(
+            [
+                ("embed", bf16_hash(&embed)),
+                ("norm", bf16_hash(&norm)),
+                ("q", bf16_hash(&q)),
+                ("k", bf16_hash(&k)),
+                ("v", bf16_hash(&v)),
+                ("qnorm", bf16_hash(&qnorm)),
+                ("knorm", bf16_hash(&knorm)),
+                ("qrope", bf16_hash(&qrope)),
+                ("krope", bf16_hash(&krope)),
+                ("value", bf16_hash(&value)),
+                ("sdpa", bf16_hash(&sdpa)),
+                ("flat", bf16_hash(&flat)),
+                ("out", bf16_hash(&out)),
+            ],
+            [
+                ("embed", 0xef0006be2976f276),
+                ("norm", 0xe7a6e7e6eeeccfc2),
+                ("q", 0x0d38f13e10b147fe),
+                ("k", 0x5951c1d02b1fb8b0),
+                ("v", 0xa945a0a940af6fe2),
+                ("qnorm", 0xb110964321ad4b34),
+                ("knorm", 0xe134a31a55653915),
+                ("qrope", 0x3370c087e3e809f1),
+                ("krope", 0xc757b57623b36400),
+                ("value", 0x0baf9f219a29b28a),
+                ("sdpa", 0xc591114599abbd67),
+                ("flat", 0x7740e35b51ad9d33),
+                ("out", 0x37c68f356e4378a4),
+            ]
+        );
+
+        let mut direct_cache = KvCache::new();
+        direct_cache
+            .update_and_fetch(krope_zero.clone(), single_value.clone())
+            .expect("direct cache insertion");
+        let (direct_key, direct_value) = direct_cache.active().expect("direct cache");
+        let key_equal: bool = direct_key
+            .eq(&krope_zero)
+            .expect("compare direct key")
+            .all(None)
+            .expect("reduce direct key equality")
+            .item();
+        let value_equal: bool = direct_value
+            .eq(&single_value)
+            .expect("compare direct value")
+            .all(None)
+            .expect("reduce direct value equality")
+            .item();
+        assert!(
+            key_equal && value_equal,
+            "cache insertion changed K/V values"
+        );
+
+        let mut cache = model.make_cache();
+        model.forward(&token, &mut cache).expect("cached forward");
+        let (cached_key, cached_value) = cache[0].active().expect("layer-0 cache");
+        assert_eq!(
+            (bf16_hash(&cached_key), bf16_hash(&cached_value)),
+            (0x08253d7535037885, 0xe5073d4a5312339f)
+        );
     }
 }

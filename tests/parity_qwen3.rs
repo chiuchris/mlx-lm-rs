@@ -8,8 +8,11 @@
 //! `MLX_LM_RS_PARITY_MAX_TOKENS`, and `MLX_LM_RS_PARITY_PYTHON` to probe another
 //! cached checkpoint without weakening the exact output comparison.
 
-use std::process::Command;
+use std::{num::NonZeroUsize, process::Command};
 
+use mlx_lm_rs::{
+    config::load_config, generate::Generator, loader::list_weight_files, models::qwen3::Model,
+};
 const DEFAULT_MODEL: &str = "mlx-community/Qwen3-0.6B-bf16";
 const DEFAULT_PROMPT: &str = "The capital of France is";
 const DEFAULT_MAX_TOKENS: usize = 16;
@@ -144,4 +147,38 @@ fn greedy_matches_python() {
         python_generated, rust_generated,
         "rust greedy output should match python mlx_lm.generate token-for-token"
     );
+}
+
+#[test]
+#[ignore = "requires MLX_LM_RS_TEST_MODEL_DIR"]
+fn ds8_greedy_matches_python_token_oracle() {
+    let model_dir = std::env::var_os("MLX_LM_RS_TEST_MODEL_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("set MLX_LM_RS_TEST_MODEL_DIR to the checkpoint snapshot");
+    let config = load_config(&model_dir).expect("load config");
+    let mut model = Model::new(config).expect("construct model");
+    let shards = list_weight_files(&model_dir).expect("list weights");
+    model.load_weights(&shards).expect("load weights");
+
+    const PROMPT: &[u32] = &[
+        151643, 151669, 45764, 14990, 258, 327, 32739, 69, 344, 365, 2260, 13, 151670,
+    ];
+    const EXPECTED_GENERATION: &[u32] = &[
+        151667, 198, 5338, 11, 279, 1196, 1053, 25, 330, 45764, 14990, 258, 327, 32739, 69, 344,
+        365, 2260, 1189, 1096, 5868, 1075, 264, 3175, 3409, 476, 264, 17133, 2041, 12621, 11, 892,
+        2578, 387, 264, 85105, 476, 36204, 5326, 311, 387, 15676, 382, 40, 1184, 311, 14198, 419,
+        13, 1084, 1410, 387, 330, 45764, 23811, 304, 6896, 4236, 4244, 1189, 476, 2494, 4428, 13,
+    ];
+    let actual = Generator::new(
+        &mut model,
+        PROMPT,
+        EXPECTED_GENERATION.len(),
+        0.0,
+        vec![151645],
+        NonZeroUsize::new(2048).unwrap(),
+    )
+    .expect("construct generator")
+    .collect::<Result<Vec<_>, _>>()
+    .expect("greedy generation");
+    assert_eq!(actual, EXPECTED_GENERATION);
 }

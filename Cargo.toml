@@ -31,8 +31,8 @@ name = "mlx_lm_rs"
 path = "src/lib.rs"
 
 [dependencies]
-mlx-rs = { version = "0.25", features = ["metal", "accelerate"] }
-mlx-sys = "0.2"
+mlx-rs = { git = "https://github.com/chiuchris/mlx-rs.git", rev = "653d38f1c6cbcf60750582553a9004ccd5a7c6d0", features = ["metal", "accelerate"] }
+mlx-sys = { git = "https://github.com/chiuchris/mlx-rs.git", rev = "653d38f1c6cbcf60750582553a9004ccd5a7c6d0" }
 tokenizers = "0.23"
 hf-hub = { version = "0.5", features = ["ureq"], default-features = false }
 serde = { version = "1", features = ["derive"] }

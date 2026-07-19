@@ -174,6 +174,7 @@ fn ds8_greedy_matches_python_token_oracle() {
         PROMPT,
         EXPECTED_GENERATION.len(),
         0.0,
+        1.0,
         vec![151645],
         NonZeroUsize::new(2048).unwrap(),
     )

@@ -41,6 +41,7 @@ pub struct ServeConfig {
     pub port: u16,
     pub default_max_tokens: usize,
     pub default_temperature: f32,
+    pub default_rep_penalty: f32,
     pub prefill_step_size: NonZeroUsize,
     pub no_chat_template: bool,
 }
@@ -146,6 +147,7 @@ fn init_worker(cfg: ServeConfig) -> Result<ModelWorker> {
         model_id: cfg.model,
         max_tokens_limit: cfg.default_max_tokens,
         default_temperature: cfg.default_temperature,
+        default_rep_penalty: cfg.default_rep_penalty,
         prefill_step_size: cfg.prefill_step_size,
     })
 }
@@ -180,6 +182,7 @@ struct ModelWorker {
     model_id: String,
     max_tokens_limit: usize,
     default_temperature: f32,
+    default_rep_penalty: f32,
     prefill_step_size: NonZeroUsize,
 }
 
@@ -245,6 +248,7 @@ impl ModelWorker {
                 &plan.prompt_ids,
                 plan.max_tokens,
                 plan.temperature,
+                plan.rep_penalty,
                 self.eos_ids.clone(),
                 self.prefill_step_size,
             )
@@ -322,6 +326,9 @@ impl ModelWorker {
             prompt_ids,
             max_tokens: req.max_tokens().unwrap_or(self.max_tokens_limit),
             temperature: req.temperature.unwrap_or(self.default_temperature),
+            rep_penalty: req
+                .repetition_penalty
+                .unwrap_or(self.default_rep_penalty),
         })
     }
 
@@ -331,6 +338,7 @@ impl ModelWorker {
             &plan.prompt_ids,
             plan.max_tokens,
             plan.temperature,
+            plan.rep_penalty,
             self.eos_ids.clone(),
             self.prefill_step_size,
         )
@@ -479,6 +487,8 @@ struct ChatCompletionRequest {
     #[serde(default)]
     temperature: Option<f32>,
     #[serde(default)]
+    repetition_penalty: Option<f32>,
+    #[serde(default)]
     stream: Option<bool>,
     #[serde(default)]
     n: Option<usize>,
@@ -514,6 +524,13 @@ impl ChatCompletionRequest {
             if !(temp == 0.0 || (temp.is_finite() && temp > 0.0)) {
                 return Err(ApiError::bad_request(
                     "temperature must be 0.0 or a finite positive value",
+                ));
+            }
+        }
+        if let Some(rp) = self.repetition_penalty {
+            if !(rp.is_finite() && rp > 0.0) {
+                return Err(ApiError::bad_request(
+                    "repetition_penalty must be a finite positive value",
                 ));
             }
         }
@@ -637,6 +654,7 @@ struct GenerationPlan {
     prompt_tokens: usize,
     max_tokens: usize,
     temperature: f32,
+    rep_penalty: f32,
 }
 
 struct GenerationResult {
@@ -761,6 +779,7 @@ mod tests {
             port: 0,
             default_max_tokens: 16,
             default_temperature: 0.0,
+            default_rep_penalty: 1.0,
             prefill_step_size: NonZeroUsize::new(2048).unwrap(),
             no_chat_template: false,
         }

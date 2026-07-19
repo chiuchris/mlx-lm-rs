@@ -51,6 +51,9 @@ enum Cmd {
         max_tokens: usize,
         #[arg(long, default_value_t = 0.0, value_parser = parse_temp)]
         temp: f32,
+        /// Repetition penalty (1.0 = no penalty, > 1.0 discourages repeats).
+        #[arg(long, default_value_t = 1.0)]
+        rep_penalty: f32,
         #[arg(long, default_value = "2048")]
         prefill_step_size: NonZeroUsize,
         /// Skip applying the chat template (use raw prompt).
@@ -78,6 +81,9 @@ enum Cmd {
         max_tokens: usize,
         #[arg(long, default_value_t = 0.0, value_parser = parse_temp)]
         temp: f32,
+        /// Default repetition penalty (1.0 = no penalty, > 1.0 discourages repeats).
+        #[arg(long, default_value_t = 1.0)]
+        rep_penalty: f32,
         #[arg(long, default_value = "2048")]
         prefill_step_size: NonZeroUsize,
         /// Skip applying the chat template (render messages as plain text).
@@ -95,6 +101,7 @@ async fn main() -> Result<()> {
             prompt,
             max_tokens,
             temp,
+            rep_penalty,
             prefill_step_size,
             no_chat_template,
             no_stats,
@@ -152,6 +159,7 @@ async fn main() -> Result<()> {
                 &prompt_ids,
                 max_tokens,
                 temp,
+                rep_penalty,
                 eos_ids,
                 prefill_step_size,
             )?;
@@ -198,6 +206,7 @@ async fn main() -> Result<()> {
             port,
             max_tokens,
             temp,
+            rep_penalty,
             prefill_step_size,
             no_chat_template,
         } => {
@@ -207,6 +216,7 @@ async fn main() -> Result<()> {
                 port,
                 default_max_tokens: max_tokens,
                 default_temperature: temp,
+                default_rep_penalty: rep_penalty,
                 prefill_step_size,
                 no_chat_template,
             })

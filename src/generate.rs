@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 
 use mlx_rs::{
@@ -19,6 +20,8 @@ pub struct Generator<'a> {
     model: &'a mut Model,
     cache: Vec<KvCache>,
     temp: f32,
+    rep_penalty: f32,
+    generated_ids: HashSet<u32>,
     eos_ids: Vec<u32>,
     max_tokens: usize,
     produced: usize,
@@ -37,6 +40,7 @@ impl<'a> Generator<'a> {
         prompt_ids: &[u32],
         max_tokens: usize,
         temp: f32,
+        rep_penalty: f32,
         eos_ids: Vec<u32>,
         prefill_step_size: NonZeroUsize,
     ) -> Result<Self> {
@@ -47,6 +51,7 @@ impl<'a> Generator<'a> {
             cache,
             max_tokens,
             temp,
+            rep_penalty,
             eos_ids,
             prefill_step_size,
         )
@@ -58,6 +63,7 @@ impl<'a> Generator<'a> {
         mut cache: Vec<KvCache>,
         max_tokens: usize,
         temp: f32,
+        rep_penalty: f32,
         eos_ids: Vec<u32>,
         prefill_step_size: NonZeroUsize,
     ) -> Result<Self> {
@@ -96,7 +102,7 @@ impl<'a> Generator<'a> {
         } else {
             let last = prompt_ids[prompt_ids.len() - 1];
             let input = Array::from_slice(&[last], &[1, 1]);
-            let p = step_decode(model, &mut cache, &input, temp)?;
+            let p = step_decode(model, &mut cache, &input, temp, rep_penalty, &HashSet::new())?;
             async_eval(std::iter::once(&p))?;
             Some(p)
         };
@@ -105,6 +111,8 @@ impl<'a> Generator<'a> {
             model,
             cache,
             temp,
+            rep_penalty,
+            generated_ids: HashSet::new(),
             eos_ids,
             max_tokens,
             produced: 0,
@@ -124,10 +132,12 @@ fn step_decode(
     cache: &mut [KvCache],
     input: &Array,
     temp: f32,
+    rep_penalty: f32,
+    generated_ids: &HashSet<u32>,
 ) -> Result<Array> {
     let logits = model.forward(input, cache)?;
     let last = logits.index((.., -1, ..));
-    sample(&last, temp)
+    sample(&last, temp, rep_penalty, generated_ids)
 }
 
 impl Iterator for Generator<'_> {
@@ -146,7 +156,7 @@ impl Iterator for Generator<'_> {
             Ok(x) => x,
             Err(e) => return Some(Err(e.into())),
         };
-        let next = match step_decode(self.model, &mut self.cache, &input, self.temp) {
+        let next = match step_decode(self.model, &mut self.cache, &input, self.temp, self.rep_penalty, &self.generated_ids) {
             Ok(t) => t,
             Err(e) => return Some(Err(e)),
         };
@@ -158,6 +168,7 @@ impl Iterator for Generator<'_> {
         // `.item()` blocks until materialization. Most of that wait already
         // happened during the next-step graph build above.
         let tok: u32 = cur.item();
+        self.generated_ids.insert(tok);
         self.produced += 1;
 
         if self.produced.is_multiple_of(CLEAR_CACHE_EVERY) {

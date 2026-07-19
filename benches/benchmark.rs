@@ -114,7 +114,7 @@ fn run_once(prompt: &str) -> RunStats {
 
     let prefill_start = Instant::now();
     let mut gen =
-        Generator::new(&mut g.model, &ids, max_tok, 0.0, eos_ids, step).expect("generator");
+        Generator::new(&mut g.model, &ids, max_tok, 0.0, 1.0, eos_ids, step).expect("generator");
     let _ = gen.next().transpose().expect("first token");
     let prefill_secs = prefill_start.elapsed().as_secs_f64();
 
